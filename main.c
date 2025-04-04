@@ -1,0 +1,707 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "cmox_crypto.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+CRC_HandleTypeDef hcrc;
+
+RNG_HandleTypeDef hrng;
+
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+
+/* USER CODE BEGIN PV */
+
+uint8_t single_byte;
+
+#define SHARED_SECRET_SIZE 32  // ECDH Shared Secret (256-bit key -> 32 bytes)
+
+uint8_t computed_secret[SHARED_SECRET_SIZE];  // Buffer to store shared secret
+size_t computed_size;  // Size of shared secret
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_CRC_Init(void);
+static void MX_RNG_Init(void);
+
+/* USER CODE BEGIN PFP */
+#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+#define ECC_CURVE_PARAMS CMOX_ECC_SECP256R1_LOWMEM 	// Example curve (secp256r1)
+#define RANDOM_BUFFER_SIZE 32                       // Size of the random buffer
+#define ECC_PRIVATE_KEY_SIZE 32                     // Size for secp256r1 (256 bits / 8 = 32 bytes)
+#define ECC_PUBLIC_KEY_SIZE 64                      // Public key (X and Y each 32 bytes)
+#define MESSAGE_MAX_LEN 256   						// Maximum message length
+#define SIGNATURE_SIZE 64     						// ECDSA signature (32-Byte R + 32-Byte S)
+#define CMOX_SHA256_SIZE 32							// CMOX_SHA256_SIZE 32 byte
+#define NUM_KEYS 3
+
+
+uint8_t private_keys[NUM_KEYS][ECC_PRIVATE_KEY_SIZE]; // Array for private keys
+uint8_t public_keys[NUM_KEYS][ECC_PUBLIC_KEY_SIZE];   // Array for public keys
+size_t private_key_lens[NUM_KEYS], public_key_lens[NUM_KEYS];
+int current_key_index = 0; // current used key
+
+uint8_t random_buffer[RANDOM_BUFFER_SIZE];         // Random seed for private key generation
+
+uint8_t working_buffer[4096];                      // Working buffer for ECC computations
+cmox_ecc_handle_t ecc_ctx;                         // ECC context
+
+// Empfangs- und Sende-Puffer
+uint8_t message_buffer[MESSAGE_MAX_LEN];
+uint8_t computed_hash[CMOX_SHA256_SIZE];
+uint8_t computed_signature[SIGNATURE_SIZE];
+
+
+void generate_random_bytes(uint8_t *buffer, size_t length) {
+    for (size_t i = 0; i < length; i += 4) {
+        uint32_t random_number;
+
+        // Check if the RNG generation was successful
+        if (HAL_RNG_GenerateRandomNumber(&hrng, &random_number) != HAL_OK) {
+            // ERROR: TRNG failed
+            HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: TRNG failed!\r\n", 21, HAL_MAX_DELAY);
+            Error_Handler();  // Halt execution (optional, or return error)
+            return;
+        }
+
+        // Prevent buffer overflow for remaining bytes
+        if (i + 4 <= length) {
+            memcpy(&buffer[i], &random_number, sizeof(uint32_t));
+        } else {
+            memcpy(&buffer[i], &random_number, length - i);
+        }
+    }
+}
+
+void generate_all_keys(void) {
+    for (int i = 0; i < NUM_KEYS; i++) {
+        cmox_ecc_construct(&ecc_ctx, CMOX_MATH_FUNCS_SMALL, working_buffer, sizeof(working_buffer));
+        generate_random_bytes(random_buffer, RANDOM_BUFFER_SIZE);
+
+        cmox_ecc_retval_t retval;
+
+        retval = cmox_ecdsa_keyGen(
+            &ecc_ctx,
+            ECC_CURVE_PARAMS,
+            random_buffer, RANDOM_BUFFER_SIZE,
+            private_keys[i], &private_key_lens[i],
+            public_keys[i], &public_key_lens[i]
+        );
+
+        char msg[50];
+        snprintf(msg, sizeof(msg), "Key[%d] generation %s\r\n", i,
+                 (retval == CMOX_ECC_SUCCESS) ? "OK" : "FAILED");
+        HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+}
+
+
+bool is_current_key_valid(void) {
+    return (private_key_lens[current_key_index] == ECC_PRIVATE_KEY_SIZE &&
+            public_key_lens[current_key_index] == ECC_PUBLIC_KEY_SIZE);
+}
+
+
+void send_public_key_to_pc(void) {
+	if (!is_current_key_valid()) {
+	    HAL_UART_Transmit(&huart2, (uint8_t *)"No public key to send. Use GENKEY first.\r\n", 45, HAL_MAX_DELAY);
+	    return;
+	}
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)"[PUBKEY]\r\n", 10, HAL_MAX_DELAY); // Marker with newline
+
+    // Send currently selected public key
+    HAL_UART_Transmit(&huart2, public_keys[current_key_index], ECC_PUBLIC_KEY_SIZE, HAL_MAX_DELAY);
+
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)"[ENDKEY]\r\n", 10, HAL_MAX_DELAY); // Marker with newline
+}
+
+void flush_uart_buffer(void) {
+    uint8_t dummy;
+    while (HAL_UART_Receive(&huart2, &dummy, 1, 10) == HAL_OK) {} // Leere den Buffer
+}
+
+void print_computed_hash(uint8_t *hash, size_t length) {
+    char hash_str[65]; // 32 bytes * 2 characters per byte + null terminator
+
+    for (size_t i = 0; i < length; i++) {
+        snprintf(&hash_str[i * 2], 3, "%02X", hash[i]);  // Convert to hex string
+    }
+
+    // Send the computed hash over UART
+    HAL_UART_Transmit(&huart2, (uint8_t *)"Computed Hash: ", 15, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t *)hash_str, strlen(hash_str), HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
+}
+
+void sign_message() {
+	if (!is_current_key_valid()) {
+	    HAL_UART_Transmit(&huart2, (uint8_t *)"No valid key available. Use GENKEY first.\r\n", 45, HAL_MAX_DELAY);
+	    return;
+	}
+
+    cmox_ecc_retval_t retval;
+    uint8_t random_data[32];
+    size_t computed_size;
+    uint8_t received_byte;
+    size_t msg_index = 0;
+    uint8_t message[MESSAGE_MAX_LEN];
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)"Waiting for message...\r\n", 24, HAL_MAX_DELAY);
+
+    // Read message until we receive [ENDSIGN]
+    while (msg_index < MESSAGE_MAX_LEN - 1) {
+        HAL_UART_Receive(&huart2, &received_byte, 1, HAL_MAX_DELAY);
+
+        if (received_byte == '[') {
+            // Check for the end marker
+            uint8_t buffer[8] = {0};
+            HAL_UART_Receive(&huart2, buffer, 8, HAL_MAX_DELAY);
+            if (strncmp((char *)buffer, "ENDSIGN]", 8) == 0) {
+                break;  // Exit the loop
+            }
+        }
+
+        // Ignore newline and carriage return characters
+        if (received_byte != '\r' && received_byte != '\n') {
+            message_buffer[msg_index++] = received_byte;
+        }
+    }
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)"Message Received!\r\n", 19, HAL_MAX_DELAY);
+
+    printf(message_buffer);
+
+    // Compute SHA-256 HASH
+    retval = cmox_hash_compute(
+        CMOX_SHA256_ALGO,
+		message_buffer, msg_index,
+        computed_hash,
+        CMOX_SHA256_SIZE,
+        &computed_size
+    );
+
+    if (retval != CMOX_HASH_SUCCESS) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: Hashing failed\r\n", 23, HAL_MAX_DELAY);
+    } else {
+    	print_computed_hash(computed_hash, CMOX_SHA256_SIZE);
+    	HAL_UART_Transmit(&huart2, (uint8_t *)"SHA-256 Hash Computed Successfully!\r\n", 38, HAL_MAX_DELAY);
+    }
+
+    // Initialize ECC context (small memory footprint)
+    //cmox_ecc_construct(&ecc_ctx, CMOX_MATH_FUNCS_SMALL, working_buffer, sizeof(working_buffer));
+
+    generate_random_bytes(random_buffer, sizeof(random_buffer));  // Fill buffer with randomness
+
+    // Sign the message hash
+    retval = cmox_ecdsa_sign(
+        &ecc_ctx,
+        CMOX_ECC_CURVE_SECP256R1,
+        random_buffer, sizeof(random_buffer),
+        private_keys[current_key_index], private_key_lens[current_key_index],
+        computed_hash, CMOX_SHA256_SIZE,
+        computed_signature, &computed_size
+    );
+
+
+    if (retval == CMOX_ECC_SUCCESS) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"✅ STM32 Self Verification SUCCESS\r\n", 36, HAL_MAX_DELAY);
+    } else {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"❌ STM32 Self Verification FAILED\r\n", 35, HAL_MAX_DELAY);
+    }
+
+    // Clean up ECC context
+    //cmox_ecc_cleanup(&ecc_ctx);
+
+    // Check if signing was successful
+    if (retval != CMOX_ECC_SUCCESS) {
+        char *error_msg = "ERROR: Signing failed\r\n";
+        HAL_UART_Transmit(&huart2, (uint8_t *)error_msg, strlen(error_msg), HAL_MAX_DELAY);
+        return;
+    }
+
+    // Send acknowledgment
+    HAL_UART_Transmit(&huart2, (uint8_t *)"[SIGN]\r\n", 8, HAL_MAX_DELAY);
+
+    // Send the ECDSA signature (64 bytes)
+    HAL_UART_Transmit(&huart2, computed_signature, SIGNATURE_SIZE, HAL_MAX_DELAY);
+
+    // Send end marker
+    HAL_UART_Transmit(&huart2, (uint8_t *)"[ENDSIGN]\r\n", 11, HAL_MAX_DELAY);
+}
+
+void key_info(void) {
+    char buffer[100];
+
+    for (int i = 0; i < NUM_KEYS; i++) {
+        int is_valid = (private_key_lens[i] > 0 && public_key_lens[i] > 0);
+
+        if (is_valid) {
+            snprintf(buffer, sizeof(buffer), "Key %d (HEX)%s:\r\n",
+                     i, (i == current_key_index) ? " [aktiv]" : "");
+            HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
+
+            for (int j = 0; j < ECC_PUBLIC_KEY_SIZE; j++) {
+                snprintf(buffer, sizeof(buffer), "%02X", public_keys[i][j]);
+                HAL_UART_Transmit(&huart2, (uint8_t *)buffer, 2, HAL_MAX_DELAY);
+
+                if ((j + 1) % 32 == 0)
+                    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
+            }
+
+        } else {
+            snprintf(buffer, sizeof(buffer), "Key %d: ❌ empty\r\n", i);
+            HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
+        }
+    }
+}
+
+
+
+void delete_all_keys(void) {
+    for (int i = 0; i < NUM_KEYS; i++) {
+        memset(private_keys[i], 0, ECC_PRIVATE_KEY_SIZE);
+        memset(public_keys[i], 0, ECC_PUBLIC_KEY_SIZE);
+        private_key_lens[i] = 0;
+        public_key_lens[i] = 0;
+    }
+    current_key_index = 0;
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)"All keys deleted. Reset to key index 0.\r\n", 42, HAL_MAX_DELAY);
+}
+
+
+void process_command(void) {
+    char command_buffer[20] = {0};  // Buffer for command
+    size_t index = 0;
+
+    flush_uart_buffer();  // Clear UART buffer
+
+    // Read command until newline ('\n') is received
+    while (index < sizeof(command_buffer) - 1) {
+        uint8_t byte;
+        HAL_UART_Receive(&huart2, &byte, 1, HAL_MAX_DELAY);
+
+        if (byte == '\r' || byte == '\n') {  // Accept both '\n' and '\r\n' {
+            command_buffer[index] = '\0';
+            break;
+        }
+        command_buffer[index++] = byte;
+    }
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)"\nReceived: ", 11, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t *)command_buffer, strlen(command_buffer), HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
+
+    // Check command and execute corresponding function
+    if (strcmp(command_buffer, "GENKEY") == 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"Generating new key pairs...\r\n", 29, HAL_MAX_DELAY);
+        generate_all_keys();
+    }
+    else if (strcmp(command_buffer, "SENDPUB") == 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"Sending public key...\r\n", 24, HAL_MAX_DELAY);
+        send_public_key_to_pc();
+    }
+    else if (strcmp(command_buffer, "SIGN") == 0) {
+        //HAL_UART_Transmit(&huart2, (uint8_t *)"Waiting for message to sign...\r\n", 32, HAL_MAX_DELAY);
+        sign_message();
+    }
+    else if (strcmp(command_buffer, "DELKEYS") == 0) {
+        delete_all_keys();
+    }
+    else if (strcmp(command_buffer, "KEYINFO") == 0) {
+        key_info();
+    }
+
+    else if (strncmp(command_buffer, "USEKEY", 6) == 0) {
+        int key_idx = atoi(&command_buffer[6]);
+        if (key_idx >= 0 && key_idx < NUM_KEYS) {
+            current_key_index = key_idx;
+            char msg[40];
+            snprintf(msg, sizeof(msg), "Using key index %d\r\n", current_key_index);
+            HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+        } else {
+            HAL_UART_Transmit(&huart2, (uint8_t *)"Invalid key index!\r\n", 21, HAL_MAX_DELAY);
+        }
+    }
+
+    else if (strcmp(command_buffer, "HELP") == 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)
+            "\nCommands:\n"
+            "GENKEY  - Generate ECDSA key pair\r\n"
+            "SENDPUB - Send public key\r\n"
+            "SIGN    - Sign a received message\r\n"
+            "HELP    - Show this menu\r\n",
+            100, HAL_MAX_DELAY);
+    }
+    else {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"Unknown command. Type HELP for list.\r\n", 38, HAL_MAX_DELAY);
+    }
+}
+
+
+
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_USART2_UART_Init();
+  MX_CRC_Init();
+  MX_RNG_Init();
+  /* USER CODE BEGIN 2 */
+
+
+  const char *welcome_message = "\r\nWelcome to HSM Generator on STM32G474RE\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)welcome_message, strlen(welcome_message), HAL_MAX_DELAY);
+
+  //HAL_UART_Transmit(&huart2, (uint8_t *)"Starting ECDSA Key Generation...\r\n", 34, HAL_MAX_DELAY);
+
+
+  /* generate ecc key pair
+  generate_ecdsa_key_pair();
+
+  // send public key to pc
+  send_public_key_to_pc();
+
+  //get sign request
+  process_sign_request();
+
+  */
+  //  cmox_ecc_cleanup(&Ecc_Ctx);
+  // wait to receive message (to get signed)
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+
+  /* Buffer and input control variables */
+
+
+  while (1)
+  {
+	  /*
+	  printf("test\n");
+	  HAL_Delay(1000);*/
+
+	  process_command();
+	  HAL_UART_Transmit(&huart2, (uint8_t *)"\nWaiting for command...\r\n", 26, HAL_MAX_DELAY);
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief CRC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CRC_Init(void)
+{
+
+  /* USER CODE BEGIN CRC_Init 0 */
+
+  /* USER CODE END CRC_Init 0 */
+
+  /* USER CODE BEGIN CRC_Init 1 */
+
+  /* USER CODE END CRC_Init 1 */
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CRC_Init 2 */
+
+  /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
+  * @brief RNG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RNG_Init(void)
+{
+
+  /* USER CODE BEGIN RNG_Init 0 */
+
+  /* USER CODE END RNG_Init 0 */
+
+  /* USER CODE BEGIN RNG_Init 1 */
+
+  /* USER CODE END RNG_Init 1 */
+  hrng.Instance = RNG;
+  hrng.Init.ClockErrorDetection = RNG_CED_ENABLE;
+  if (HAL_RNG_Init(&hrng) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RNG_Init 2 */
+
+  /* USER CODE END RNG_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+/**
+  * @brief  Retargets the C library printf function to the USART.
+  *   None
+  * @retval None
+  */
+PUTCHAR_PROTOTYPE
+{
+  /* Place your implementation of fputc here */
+  /* e.g. write a character to the USART1 and Loop until the end of transmission */
+  HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
+
+  return ch;
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
