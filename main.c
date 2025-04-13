@@ -24,7 +24,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include "string.h"
+#include "stm32g4xx_hal.h"
 
+#include "stm32g4xx_hal_flash.h"
+#include "stm32g4xx_hal_flash_ex.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,9 +58,9 @@ DMA_HandleTypeDef hdma_usart2_rx;
 uint8_t single_byte;
 
 #define SHARED_SECRET_SIZE 32  // ECDH Shared Secret (256-bit key -> 32 bytes)
-
 uint8_t computed_secret[SHARED_SECRET_SIZE];  // Buffer to store shared secret
 size_t computed_size;  // Size of shared secret
+
 
 /* USER CODE END PV */
 
@@ -83,6 +87,17 @@ static void MX_RNG_Init(void);
 #define CMOX_SHA256_SIZE 32							// CMOX_SHA256_SIZE 32 byte
 #define NUM_KEYS 3
 
+#define LOG_FLASH_START_ADDR   0x0807F800U      // last page in 512KB flash
+#define LOG_FLASH_PAGE_SIZE    2048
+#define LOG_ENTRY_SIZE         64
+#define LOG_MAX_ENTRIES        (LOG_FLASH_PAGE_SIZE / LOG_ENTRY_SIZE)
+
+typedef struct {
+    uint32_t timestamp;
+    char message[60];  // total size: 64 bytes
+} FlashLogEntry;
+
+
 
 uint8_t private_keys[NUM_KEYS][ECC_PRIVATE_KEY_SIZE]; // Array for private keys
 uint8_t public_keys[NUM_KEYS][ECC_PUBLIC_KEY_SIZE];   // Array for public keys
@@ -98,6 +113,74 @@ cmox_ecc_handle_t ecc_ctx;                         // ECC context
 uint8_t message_buffer[MESSAGE_MAX_LEN];
 uint8_t computed_hash[CMOX_SHA256_SIZE];
 uint8_t computed_signature[SIGNATURE_SIZE];
+
+
+typedef struct {
+    uint32_t timestamp;
+    char event[60];  // 4 + 60 = 64 Byte
+} LogEntry;
+
+
+void flash_log_event(const char *text) {
+    FlashLogEntry entry;
+    entry.timestamp = HAL_GetTick();
+    strncpy(entry.message, text, sizeof(entry.message) - 1);
+    entry.message[sizeof(entry.message) - 1] = '\0';
+
+    HAL_FLASH_Unlock();
+
+    uint32_t addr = LOG_FLASH_START_ADDR;
+
+    for (int i = 0; i < LOG_MAX_ENTRIES; i++) {
+        if (*(uint64_t *)addr == 0xFFFFFFFFFFFFFFFF) {  // free slot
+            const uint8_t *data = (uint8_t *)&entry;
+
+            for (int j = 0; j < sizeof(FlashLogEntry); j += 8) {
+                uint64_t word;
+                memcpy(&word, data + j, 8);
+                HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + j, word);
+            }
+
+            HAL_FLASH_Lock();
+            return;
+        }
+
+        addr += LOG_ENTRY_SIZE;
+    }
+
+    HAL_FLASH_Lock();
+
+    // Optionally: if full, erase and start fresh
+    // flash_log_clear();  // optional auto-erase
+}
+
+void flash_log_read(UART_HandleTypeDef *huart) {
+    char buffer[100];
+    uint32_t addr = LOG_FLASH_START_ADDR;
+
+    for (int i = 0; i < LOG_MAX_ENTRIES; i++) {
+        FlashLogEntry entry;
+        memcpy(&entry, (void *)addr, sizeof(FlashLogEntry));
+
+        // Stop reading if the timestamp is invalid (empty slot)
+        if (entry.timestamp == 0xFFFFFFFF || entry.timestamp == 0x00000000) {
+            break;
+        }
+
+        // Ensure the message is null-terminated (just in case)
+        entry.message[sizeof(entry.message) - 1] = '\0';
+
+        // Format and transmit the log entry
+        int len = snprintf(buffer, sizeof(buffer), "[%lu] %s\r\n", entry.timestamp, entry.message);
+
+        if (len > 0 && len < sizeof(buffer)) {
+            HAL_UART_Transmit(huart, (uint8_t *)buffer, len, HAL_MAX_DELAY);
+        }
+
+        addr += LOG_ENTRY_SIZE;
+    }
+}
+
 
 
 void generate_random_bytes(uint8_t *buffer, size_t length) {
@@ -346,6 +429,7 @@ void process_command(void) {
     if (strcmp(command_buffer, "GENKEY") == 0) {
         HAL_UART_Transmit(&huart2, (uint8_t *)"Generating new key pairs...\r\n", 29, HAL_MAX_DELAY);
         generate_all_keys();
+        flash_log_event("Key 1 generated");
     }
     else if (strcmp(command_buffer, "SENDPUB") == 0) {
         HAL_UART_Transmit(&huart2, (uint8_t *)"Sending public key...\r\n", 24, HAL_MAX_DELAY);
@@ -361,6 +445,11 @@ void process_command(void) {
     else if (strcmp(command_buffer, "KEYINFO") == 0) {
         key_info();
     }
+    else if (strcmp(command_buffer, "GETLOGS") == 0) {
+        flash_log_read(&huart2);
+    }
+
+
 
     else if (strncmp(command_buffer, "USEKEY", 6) == 0) {
         int key_idx = atoi(&command_buffer[6]);
@@ -429,10 +518,10 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
 
-  const char *welcome_message = "\r\nWelcome to HSM Generator on STM32G474RE\r\n";
+  const char *welcome_message = "\r\nWelcome to HSM Firmware on STM32G474RE\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)welcome_message, strlen(welcome_message), HAL_MAX_DELAY);
+  flash_log_event("BOOT OK");
 
-  //HAL_UART_Transmit(&huart2, (uint8_t *)"Starting ECDSA Key Generation...\r\n", 34, HAL_MAX_DELAY);
 
 
   /* generate ecc key pair
