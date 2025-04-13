@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "cmox_crypto.h"
@@ -50,6 +51,8 @@ CRC_HandleTypeDef hcrc;
 
 RNG_HandleTypeDef hrng;
 
+RTC_HandleTypeDef hrtc;
+
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
 
@@ -71,7 +74,7 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_CRC_Init(void);
 static void MX_RNG_Init(void);
-
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 /* USER CODE END PFP */
@@ -92,13 +95,6 @@ static void MX_RNG_Init(void);
 #define LOG_ENTRY_SIZE         64
 #define LOG_MAX_ENTRIES        (LOG_FLASH_PAGE_SIZE / LOG_ENTRY_SIZE)
 
-typedef struct {
-    uint32_t timestamp;
-    char message[60];  // total size: 64 bytes
-} FlashLogEntry;
-
-
-
 uint8_t private_keys[NUM_KEYS][ECC_PRIVATE_KEY_SIZE]; // Array for private keys
 uint8_t public_keys[NUM_KEYS][ECC_PUBLIC_KEY_SIZE];   // Array for public keys
 size_t private_key_lens[NUM_KEYS], public_key_lens[NUM_KEYS];
@@ -116,16 +112,32 @@ uint8_t computed_signature[SIGNATURE_SIZE];
 
 
 typedef struct {
-    uint32_t timestamp;
-    char event[60];  // 4 + 60 = 64 Byte
-} LogEntry;
+    uint32_t timestamp;     // From HAL_GetTick()
+    char message[60];       // Log message (null-terminated)
+} FlashLogEntry;
+
 
 
 void flash_log_event(const char *text) {
-    FlashLogEntry entry;
-    entry.timestamp = HAL_GetTick();
-    strncpy(entry.message, text, sizeof(entry.message) - 1);
-    entry.message[sizeof(entry.message) - 1] = '\0';
+	RTC_TimeTypeDef sTime;
+	RTC_DateTypeDef sDate;
+	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+
+	FlashLogEntry entry;
+
+	char timestamped_msg[60];
+	snprintf(timestamped_msg, sizeof(timestamped_msg),
+	         "%04d-%02d-%02d %02d:%02d:%02d %s",
+	         2000 + sDate.Year, sDate.Month, sDate.Date,
+	         sTime.Hours, sTime.Minutes, sTime.Seconds, text);
+
+	strncpy(entry.message, timestamped_msg, sizeof(entry.message) - 1);
+	entry.message[sizeof(entry.message) - 1] = '\0';
+
+	entry.timestamp = HAL_GetTick();  // optional, can keep or remove if unused
+
+
 
     HAL_FLASH_Unlock();
 
@@ -402,9 +414,47 @@ void delete_all_keys(void) {
     HAL_UART_Transmit(&huart2, (uint8_t *)"All keys deleted. Reset to key index 0.\r\n", 42, HAL_MAX_DELAY);
 }
 
+void set_rtc_from_command(char *cmd, UART_HandleTypeDef *huart)
+{
+    int year, month, day, hour, min, sec;
+
+    // Expecting format: "SETRTC YYYY-MM-DD HH:MM:SS"
+    if (sscanf(cmd, "SETRTC %d-%d-%d %d:%d:%d",
+               &year, &month, &day, &hour, &min, &sec) == 6)
+    {
+        RTC_TimeTypeDef sTime = {0};
+        RTC_DateTypeDef sDate = {0};
+
+        sTime.Hours   = hour;
+        sTime.Minutes = min;
+        sTime.Seconds = sec;
+
+        sDate.Year  = year - 2000;  // RTC stores 0–99 (for 2000–2099)
+        sDate.Month = month;
+        sDate.Date  = day;
+        sDate.WeekDay = RTC_WEEKDAY_MONDAY;  // Optional: used only if needed
+
+        if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN) == HAL_OK &&
+            HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN) == HAL_OK)
+        {
+            const char *ok = "✅ RTC updated.\r\n";
+            HAL_UART_Transmit(huart, (uint8_t*)ok, strlen(ok), HAL_MAX_DELAY);
+        }
+        else
+        {
+            const char *fail = "❌ RTC update failed.\r\n";
+            HAL_UART_Transmit(huart, (uint8_t*)fail, strlen(fail), HAL_MAX_DELAY);
+        }
+    }
+    else
+    {
+        const char *syntax = "❌ Invalid format. Use: SETRTC YYYY-MM-DD HH:MM:SS\r\n";
+        HAL_UART_Transmit(huart, (uint8_t*)syntax, strlen(syntax), HAL_MAX_DELAY);
+    }
+}
 
 void process_command(void) {
-    char command_buffer[20] = {0};  // Buffer for command
+    char command_buffer[64] = {0};  // Buffer for command
     size_t index = 0;
 
     flush_uart_buffer();  // Clear UART buffer
@@ -448,7 +498,9 @@ void process_command(void) {
     else if (strcmp(command_buffer, "GETLOGS") == 0) {
         flash_log_read(&huart2);
     }
-
+    else if (strncmp((char*)command_buffer, "SETRTC", 6) == 0) {
+        set_rtc_from_command((char*)command_buffer, &huart2);
+    }
 
 
     else if (strncmp(command_buffer, "USEKEY", 6) == 0) {
@@ -515,6 +567,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_CRC_Init();
   MX_RNG_Init();
+  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -571,20 +624,21 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
-  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
+  RCC_OscInitStruct.PLL.PLLN = 12;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV4;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -600,7 +654,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -661,6 +715,72 @@ static void MX_RNG_Init(void)
   /* USER CODE BEGIN RNG_Init 2 */
 
   /* USER CODE END RNG_Init 2 */
+
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  hrtc.Init.OutPutPullUp = RTC_OUTPUT_PULLUP_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.SubSeconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
 
 }
 
