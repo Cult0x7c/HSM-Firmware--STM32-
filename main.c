@@ -91,10 +91,13 @@ static void MX_RTC_Init(void);
 #define NUM_KEYS 3
 
 #define LOG_FLASH_START_ADDR   0x0807F800U      // last page in 512KB flash
-#define LOG_FLASH_PAGE_SIZE    2048
+#define LOG_FLASH_PAGE_SIZE    2048U
 #define LOG_ENTRY_SIZE         64
 #define LOG_MAX_ENTRIES        (LOG_FLASH_PAGE_SIZE / LOG_ENTRY_SIZE)
+#define FLASH_PAGE_SIZE LOG_FLASH_PAGE_SIZE  // ✅ Fixes the missing macro
 
+#define FLASH_BASE_ADDR     0x08000000U
+#define FLASH_PAGE_NUMBER   ((LOG_FLASH_START_ADDR - FLASH_BASE_ADDR) / FLASH_PAGE_SIZE)
 uint8_t private_keys[NUM_KEYS][ECC_PRIVATE_KEY_SIZE]; // Array for private keys
 uint8_t public_keys[NUM_KEYS][ECC_PUBLIC_KEY_SIZE];   // Array for public keys
 size_t private_key_lens[NUM_KEYS], public_key_lens[NUM_KEYS];
@@ -118,80 +121,126 @@ typedef struct {
 
 
 
-void flash_log_event(const char *text) {
-	RTC_TimeTypeDef sTime;
-	RTC_DateTypeDef sDate;
-	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+void flash_log_event_with_data(const char *command, const char *data)
+{
+    RTC_TimeTypeDef sTime;
+    RTC_DateTypeDef sDate;
+    HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 
-	FlashLogEntry entry;
+    FlashLogEntry entry;
 
-	char timestamped_msg[60];
-	snprintf(timestamped_msg, sizeof(timestamped_msg),
-	         "%04d-%02d-%02d %02d:%02d:%02d %s",
-	         2000 + sDate.Year, sDate.Month, sDate.Date,
-	         sTime.Hours, sTime.Minutes, sTime.Seconds, text);
+    // Format timestamp
+    char timestamp[32];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
+             2000 + sDate.Year, sDate.Month, sDate.Date,
+             sTime.Hours, sTime.Minutes, sTime.Seconds);
 
-	strncpy(entry.message, timestamped_msg, sizeof(entry.message) - 1);
-	entry.message[sizeof(entry.message) - 1] = '\0';
+    // Combine timestamp + command + optional data
+    if (data && strlen(data) > 0) {
+        snprintf(entry.message, sizeof(entry.message), "[%s] %s | %s", timestamp, command, data);
+    } else {
+        snprintf(entry.message, sizeof(entry.message), "[%s] %s", timestamp, command);
+    }
 
-	entry.timestamp = HAL_GetTick();  // optional, can keep or remove if unused
+    entry.message[sizeof(entry.message) - 1] = '\0';
 
-
-
+    // Write to Flash (unchanged)
     HAL_FLASH_Unlock();
-
     uint32_t addr = LOG_FLASH_START_ADDR;
 
     for (int i = 0; i < LOG_MAX_ENTRIES; i++) {
-        if (*(uint64_t *)addr == 0xFFFFFFFFFFFFFFFF) {  // free slot
-            const uint8_t *data = (uint8_t *)&entry;
-
+        if (*(uint64_t *)addr == 0xFFFFFFFFFFFFFFFF) {
+            const uint8_t *data_ptr = (uint8_t *)&entry;
             for (int j = 0; j < sizeof(FlashLogEntry); j += 8) {
                 uint64_t word;
-                memcpy(&word, data + j, 8);
+                memcpy(&word, data_ptr + j, 8);
                 HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + j, word);
             }
-
             HAL_FLASH_Lock();
             return;
         }
-
         addr += LOG_ENTRY_SIZE;
     }
 
     HAL_FLASH_Lock();
-
-    // Optionally: if full, erase and start fresh
-    // flash_log_clear();  // optional auto-erase
 }
 
+
+
 void flash_log_read(UART_HandleTypeDef *huart) {
-    char buffer[100];
     uint32_t addr = LOG_FLASH_START_ADDR;
 
     for (int i = 0; i < LOG_MAX_ENTRIES; i++) {
         FlashLogEntry entry;
         memcpy(&entry, (void *)addr, sizeof(FlashLogEntry));
 
-        // Stop reading if the timestamp is invalid (empty slot)
-        if (entry.timestamp == 0xFFFFFFFF || entry.timestamp == 0x00000000) {
+        // Stop if this is an unused log slot
+        if (entry.message[0] == 0xFF || entry.message[0] == '\0') {
             break;
         }
 
-        // Ensure the message is null-terminated (just in case)
+        // Safety: ensure null-termination
         entry.message[sizeof(entry.message) - 1] = '\0';
 
-        // Format and transmit the log entry
-        int len = snprintf(buffer, sizeof(buffer), "[%lu] %s\r\n", entry.timestamp, entry.message);
-
-        if (len > 0 && len < sizeof(buffer)) {
-            HAL_UART_Transmit(huart, (uint8_t *)buffer, len, HAL_MAX_DELAY);
-        }
+        // Transmit directly (already contains timestamp)
+        HAL_UART_Transmit(huart, (uint8_t *)entry.message, strlen(entry.message), HAL_MAX_DELAY);
+        HAL_UART_Transmit(huart, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);  // newline
 
         addr += LOG_ENTRY_SIZE;
     }
 }
+
+
+void flash_log_clear(void)
+{
+    HAL_FLASH_Unlock();
+
+    FLASH_EraseInitTypeDef erase_config = {
+        .TypeErase = FLASH_TYPEERASE_PAGES,
+        .Banks = FLASH_BANK_1,
+        .Page = FLASH_PAGE_NUMBER,
+        .NbPages = 1
+    };
+
+    uint32_t page_error = 0;
+    HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase_config, &page_error);
+    if (status != HAL_OK) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"❌ ERASE FAILED!\r\n", 18, HAL_MAX_DELAY);
+        HAL_FLASH_Lock();
+        return;
+    }
+
+    for (uint32_t addr = LOG_FLASH_START_ADDR; addr < LOG_FLASH_START_ADDR + LOG_FLASH_PAGE_SIZE; addr += 8) {
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, 0xFFFFFFFFFFFFFFFF);
+    }
+
+
+    HAL_FLASH_Lock();
+
+    const char *msg = "✅ Flash log cleared.\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Verify again
+    bool ok = true;
+    for (int i = 0; i < LOG_FLASH_PAGE_SIZE; i++) {
+        uint8_t b = *(uint8_t *)(LOG_FLASH_START_ADDR + i);
+        if (b != 0xFF) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "❗ Residual at +0x%03X = 0x%02X\r\n", i, b);
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"🧪 Flash verify OK: All 0xFF\r\n", 30, HAL_MAX_DELAY);
+    } else {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"❗ Flash verify FAILED\r\n", 24, HAL_MAX_DELAY);
+    }
+}
+
 
 
 
@@ -230,6 +279,21 @@ void generate_all_keys(void) {
             private_keys[i], &private_key_lens[i],
             public_keys[i], &public_key_lens[i]
         );
+
+        if (retval == CMOX_ECC_SUCCESS) {
+            // Hash Public Key
+            uint8_t pubkey_hash[32];
+            cmox_hash_compute(CMOX_SHA256_ALGO, public_keys[i], public_key_lens[i], pubkey_hash, 32, NULL);
+
+            char hex_string[65] = {0};
+            for (int j = 0; j < 32; j++) {
+                sprintf(&hex_string[j * 2], "%02X", pubkey_hash[j]);
+            }
+
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "GENKEY[%d]", i);
+            flash_log_event_with_data(cmd, hex_string);
+        }
 
         char msg[50];
         snprintf(msg, sizeof(msg), "Key[%d] generation %s\r\n", i,
@@ -479,7 +543,6 @@ void process_command(void) {
     if (strcmp(command_buffer, "GENKEY") == 0) {
         HAL_UART_Transmit(&huart2, (uint8_t *)"Generating new key pairs...\r\n", 29, HAL_MAX_DELAY);
         generate_all_keys();
-        flash_log_event("Key 1 generated");
     }
     else if (strcmp(command_buffer, "SENDPUB") == 0) {
         HAL_UART_Transmit(&huart2, (uint8_t *)"Sending public key...\r\n", 24, HAL_MAX_DELAY);
@@ -497,6 +560,9 @@ void process_command(void) {
     }
     else if (strcmp(command_buffer, "GETLOGS") == 0) {
         flash_log_read(&huart2);
+    }
+    else if (strncmp((char*)command_buffer, "CLEARLOGS", 9) == 0) {
+        flash_log_clear();
     }
     else if (strncmp((char*)command_buffer, "SETRTC", 6) == 0) {
         set_rtc_from_command((char*)command_buffer, &huart2);
@@ -573,7 +639,7 @@ int main(void)
 
   const char *welcome_message = "\r\nWelcome to HSM Firmware on STM32G474RE\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)welcome_message, strlen(welcome_message), HAL_MAX_DELAY);
-  flash_log_event("BOOT OK");
+  flash_log_event_with_data("BOOT", NULL);
 
 
 
