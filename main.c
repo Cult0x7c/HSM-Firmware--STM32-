@@ -92,12 +92,13 @@ static void MX_RTC_Init(void);
 
 #define LOG_FLASH_START_ADDR   0x0807F800U      // last page in 512KB flash
 #define LOG_FLASH_PAGE_SIZE    2048U
-#define LOG_ENTRY_SIZE         64
+#define LOG_ENTRY_SIZE         96
 #define LOG_MAX_ENTRIES        (LOG_FLASH_PAGE_SIZE / LOG_ENTRY_SIZE)
 #define FLASH_PAGE_SIZE LOG_FLASH_PAGE_SIZE  // ✅ Fixes the missing macro
 
 #define FLASH_BASE_ADDR     0x08000000U
 #define FLASH_PAGE_NUMBER   ((LOG_FLASH_START_ADDR - FLASH_BASE_ADDR) / FLASH_PAGE_SIZE)
+
 uint8_t private_keys[NUM_KEYS][ECC_PRIVATE_KEY_SIZE]; // Array for private keys
 uint8_t public_keys[NUM_KEYS][ECC_PUBLIC_KEY_SIZE];   // Array for public keys
 size_t private_key_lens[NUM_KEYS], public_key_lens[NUM_KEYS];
@@ -115,9 +116,13 @@ uint8_t computed_signature[SIGNATURE_SIZE];
 
 
 typedef struct {
-    uint32_t timestamp;     // From HAL_GetTick()
-    char message[60];       // Log message (null-terminated)
+    uint32_t timestamp;
+    char message[60];       // existing log message
+    uint8_t hash[32];       // new field for chained hash (SHA-256)
 } FlashLogEntry;
+
+// Global: holds last known log hash (init with 0 or SHA256("GENESIS"))
+uint8_t previous_log_hash[32] = {0};  // initialize to 0 on boot
 
 
 
@@ -145,13 +150,29 @@ void flash_log_event_with_data(const char *command, const char *data)
 
     entry.message[sizeof(entry.message) - 1] = '\0';
 
-    // Write to Flash (unchanged)
+    // Prepare input for hash: previous hash + message
+    uint8_t hash_input[32 + sizeof(entry.message)];
+    memcpy(hash_input, previous_log_hash, 32);
+    memcpy(hash_input + 32, entry.message, sizeof(entry.message));
+
+    // Compute SHA-256 hash for current log entry
+    cmox_hash_compute(
+        CMOX_SHA256_ALGO,
+        hash_input, sizeof(hash_input),
+        entry.hash, 32,
+        NULL
+    );
+
+    // Save the new hash as the latest
+    memcpy(previous_log_hash, entry.hash, 32);
+
+    // 🔐 Write to Flash
     HAL_FLASH_Unlock();
     uint32_t addr = LOG_FLASH_START_ADDR;
 
     for (int i = 0; i < LOG_MAX_ENTRIES; i++) {
         if (*(uint64_t *)addr == 0xFFFFFFFFFFFFFFFF) {
-            const uint8_t *data_ptr = (uint8_t *)&entry;
+            const uint8_t *data_ptr = (const uint8_t *)&entry;
             for (int j = 0; j < sizeof(FlashLogEntry); j += 8) {
                 uint64_t word;
                 memcpy(&word, data_ptr + j, 8);
@@ -160,7 +181,7 @@ void flash_log_event_with_data(const char *command, const char *data)
             HAL_FLASH_Lock();
             return;
         }
-        addr += LOG_ENTRY_SIZE;
+        addr += sizeof(FlashLogEntry);
     }
 
     HAL_FLASH_Lock();
@@ -183,13 +204,68 @@ void flash_log_read(UART_HandleTypeDef *huart) {
         // Safety: ensure null-termination
         entry.message[sizeof(entry.message) - 1] = '\0';
 
-        // Transmit directly (already contains timestamp)
-        HAL_UART_Transmit(huart, (uint8_t *)entry.message, strlen(entry.message), HAL_MAX_DELAY);
-        HAL_UART_Transmit(huart, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);  // newline
+        // Format output line
+        char buffer[150];
+        char hash_str[65];  // 32 bytes * 2 chars + null terminator
 
-        addr += LOG_ENTRY_SIZE;
+        for (int j = 0; j < 32; j++) {
+            snprintf(&hash_str[j * 2], 3, "%02X", entry.hash[j]);
+        }
+
+        snprintf(buffer, sizeof(buffer), " %s\n Hash: %s\r\n", entry.message, hash_str);
+
+        // Transmit line over UART
+        HAL_UART_Transmit(huart, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
+
+        addr += sizeof(FlashLogEntry);
+    }
+
+    if (addr == LOG_FLASH_START_ADDR) {
+        const char *msg = "⚠️ No logs found.\r\n";
+        HAL_UART_Transmit(huart, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
     }
 }
+
+void flash_log_init(void) {
+    uint32_t addr = LOG_FLASH_START_ADDR;
+    FlashLogEntry entry;
+
+    int last_valid_index = -1;
+
+    // Suche letzten gültigen Logeintrag
+    for (int i = 0; i < LOG_MAX_ENTRIES; i++) {
+        memcpy(&entry, (void *)addr, sizeof(FlashLogEntry));
+
+        if (entry.message[0] == 0xFF || entry.message[0] == '\0') {
+            break;  // keine weiteren Logs
+        }
+
+        last_valid_index = i;
+        addr += sizeof(FlashLogEntry);
+    }
+
+    // Wenn mindestens ein Log vorhanden ist, lade dessen Hash
+    if (last_valid_index >= 0) {
+        uint32_t last_entry_addr = LOG_FLASH_START_ADDR + last_valid_index * sizeof(FlashLogEntry);
+        memcpy(&entry, (void *)last_entry_addr, sizeof(FlashLogEntry));
+        memcpy(previous_log_hash, entry.hash, 32);
+    } else {
+        memset(previous_log_hash, 0x00, 32);  // Initialer Hash bei leerem Log
+    }
+
+    char debug[100];
+    snprintf(debug, sizeof(debug), "🔑 Last Log Hash: ");
+    HAL_UART_Transmit(&huart2, (uint8_t *)debug, strlen(debug), HAL_MAX_DELAY);
+
+    for (int i = 0; i < 32; i++) {
+        snprintf(debug, sizeof(debug), "%02X", previous_log_hash[i]);
+        HAL_UART_Transmit(&huart2, (uint8_t *)debug, 2, HAL_MAX_DELAY);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
+
+}
+
+
 
 
 void flash_log_clear(void)
@@ -702,6 +778,8 @@ int main(void)
 	  printf("test\n");
 	  HAL_Delay(1000);*/
 	  //flash_log_event_with_data("BOOT", "OK");
+
+	  flash_log_init();  // Holt den letzten gültigen Hash
 	  process_command();
 	  HAL_UART_Transmit(&huart2, (uint8_t *)"\nWaiting for command...\r\n", 26, HAL_MAX_DELAY);
 
