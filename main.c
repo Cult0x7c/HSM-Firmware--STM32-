@@ -196,13 +196,19 @@ void flash_log_clear(void)
 {
     HAL_FLASH_Unlock();
 
+    // Overwrite everything
+    for (uint32_t addr = LOG_FLASH_START_ADDR; addr < LOG_FLASH_START_ADDR + LOG_FLASH_PAGE_SIZE; addr += 8) {
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, 0xFFFFFFFFFFFFFFFF);
+    }
+
     FLASH_EraseInitTypeDef erase_config = {
         .TypeErase = FLASH_TYPEERASE_PAGES,
-        .Banks = FLASH_BANK_1,
+        .Banks = FLASH_BANK_2,
         .Page = FLASH_PAGE_NUMBER,
         .NbPages = 1
     };
 
+    // Then delete
     uint32_t page_error = 0;
     HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase_config, &page_error);
     if (status != HAL_OK) {
@@ -211,9 +217,7 @@ void flash_log_clear(void)
         return;
     }
 
-    for (uint32_t addr = LOG_FLASH_START_ADDR; addr < LOG_FLASH_START_ADDR + LOG_FLASH_PAGE_SIZE; addr += 8) {
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, 0xFFFFFFFFFFFFFFFF);
-    }
+
 
 
     HAL_FLASH_Lock();
@@ -310,19 +314,37 @@ bool is_current_key_valid(void) {
 
 
 void send_public_key_to_pc(void) {
-	if (!is_current_key_valid()) {
-	    HAL_UART_Transmit(&huart2, (uint8_t *)"No public key to send. Use GENKEY first.\r\n", 45, HAL_MAX_DELAY);
-	    return;
-	}
+    if (!is_current_key_valid()) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"No public key to send. Use GENKEY first.\r\n", 45, HAL_MAX_DELAY);
+        return;
+    }
 
     HAL_UART_Transmit(&huart2, (uint8_t *)"[PUBKEY]\r\n", 10, HAL_MAX_DELAY); // Marker with newline
 
     // Send currently selected public key
     HAL_UART_Transmit(&huart2, public_keys[current_key_index], ECC_PUBLIC_KEY_SIZE, HAL_MAX_DELAY);
 
-
     HAL_UART_Transmit(&huart2, (uint8_t *)"[ENDKEY]\r\n", 10, HAL_MAX_DELAY); // Marker with newline
+
+    // 🔐 Compute and log hash of the sent public key
+    uint8_t pubkey_hash[32];
+    cmox_hash_compute(CMOX_SHA256_ALGO,
+                      public_keys[current_key_index],
+                      ECC_PUBLIC_KEY_SIZE,
+                      pubkey_hash,
+                      sizeof(pubkey_hash),
+                      NULL);
+
+    char hex_string[65] = {0};
+    for (int i = 0; i < 32; i++) {
+        sprintf(&hex_string[i * 2], "%02X", pubkey_hash[i]);
+    }
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "SENDPUB[%d]", current_key_index);
+    flash_log_event_with_data(cmd, hex_string);
 }
+
 
 void flush_uart_buffer(void) {
     uint8_t dummy;
@@ -395,6 +417,18 @@ void sign_message() {
     	print_computed_hash(computed_hash, CMOX_SHA256_SIZE);
     	HAL_UART_Transmit(&huart2, (uint8_t *)"SHA-256 Hash Computed Successfully!\r\n", 38, HAL_MAX_DELAY);
     }
+
+    // Convert hash to hex string for logging
+    char hash_hex[65] = {0};
+    for (int i = 0; i < CMOX_SHA256_SIZE; i++) {
+        sprintf(&hash_hex[i * 2], "%02X", computed_hash[i]);
+    }
+
+    // Format log entry
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "SIGN[%d]", current_key_index);
+    flash_log_event_with_data(cmd, hash_hex);
+
 
     // Initialize ECC context (small memory footprint)
     //cmox_ecc_construct(&ecc_ctx, CMOX_MATH_FUNCS_SMALL, working_buffer, sizeof(working_buffer));
@@ -639,7 +673,6 @@ int main(void)
 
   const char *welcome_message = "\r\nWelcome to HSM Firmware on STM32G474RE\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)welcome_message, strlen(welcome_message), HAL_MAX_DELAY);
-  flash_log_event_with_data("BOOT", NULL);
 
 
 
@@ -668,7 +701,7 @@ int main(void)
 	  /*
 	  printf("test\n");
 	  HAL_Delay(1000);*/
-
+	  //flash_log_event_with_data("BOOT", "OK");
 	  process_command();
 	  HAL_UART_Transmit(&huart2, (uint8_t *)"\nWaiting for command...\r\n", 26, HAL_MAX_DELAY);
 
