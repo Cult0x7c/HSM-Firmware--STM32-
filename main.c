@@ -77,14 +77,14 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define ECC_CURVE_PARAMS CMOX_ECC_CURVE_ED25519	// Example curve (secp256r1)
+#define ECC_CURVE_PARAMS CMOX_ECC_CURVE_SECP256R1 // Example curve (secp256r1)
 #define RANDOM_BUFFER_SIZE 32                       // Size of the random buffer
 #define ECC_PRIVATE_KEY_SIZE 32                     // Size for secp256r1 (256 bits / 8 = 32 bytes)
 #define ECC_PUBLIC_KEY_SIZE 64                      // Public key (X and Y each 32 bytes)
 #define MESSAGE_MAX_LEN 256   						// Maximum message length
 #define SIGNATURE_SIZE 64     						// ECDSA signature (32-Byte R + 32-Byte S)
 #define CMOX_SHA256_SIZE 32							// CMOX_SHA256_SIZE 32 byte
-#define NUM_KEYS 3
+#define NUM_KEYS 3									// Amount of keys
 
 #define LOG_FLASH_START_ADDR   0x0807F800U      // last page in 512KB flash
 #define LOG_FLASH_PAGE_SIZE    2048U
@@ -489,7 +489,7 @@ void sign_message() {
     // Sign the message hash
     retval = cmox_ecdsa_sign(
         &ecc_ctx,
-        CMOX_ECC_CURVE_SECP256R1,
+		ECC_CURVE_PARAMS,
         random_buffer, sizeof(random_buffer),
         private_keys[current_key_index], private_key_lens[current_key_index],
         computed_hash, CMOX_SHA256_SIZE,
